@@ -1,15 +1,17 @@
 const { ethers } = require('ethers');
 const axios = require('axios');
 const TelegramBot = require('node-telegram-bot-api');
+const WebSocket = require('ws');
 require('dotenv').config();
 
 // Configuration
 const ETH_EXECUTION_RPC = process.env.ETH_EXECUTION_RPC || 'http://sui.bridge.neuler.xyz:8545';
+const ETH_EXECUTION_WS = process.env.ETH_EXECUTION_WS || 'ws://sui.bridge.neuler.xyz:8546';
 const ETH_EXECUTION_METRICS = process.env.ETH_EXECUTION_METRICS;
 const ETH_CONSENSUS_RPC = process.env.ETH_CONSENSUS_RPC;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const CHECK_INTERVAL_MINUTES = parseInt(process.env.CHECK_INTERVAL_MINUTES || '60');
+const METRICS_POLL_INTERVAL_SEC = parseInt(process.env.METRICS_POLL_INTERVAL_SEC || '30');
 const ENABLE_TELEGRAM = process.env.ENABLE_TELEGRAM === 'true';
 
 // Reference RPCs for canonical chain comparison
@@ -23,15 +25,17 @@ const REFERENCE_RPCS = [
 const RETH_GITHUB_API = 'https://api.github.com/repos/paradigmxyz/reth/releases/latest';
 const LIGHTHOUSE_GITHUB_API = 'https://api.github.com/repos/sigp/lighthouse/releases/latest';
 
-const EXPECTED_CHAIN_ID = 1; // Ethereum Mainnet
+const EXPECTED_CHAIN_ID = 1;
 const MAX_BLOCK_DELAY = 10;
 const BLOCK_TIME_THRESHOLD_MS = 30000;
-const MAX_PEER_COUNT_LOW = 10; // Minimum healthy peers
-const MAX_MEMORY_MB = 16000; // 16GB warning threshold
+const MAX_PEER_COUNT_LOW = 10;
+const MAX_MEMORY_MB = 16000;
+const VERSION_CHECK_INTERVAL_HOURS = 6;
 
 class EthMonitor {
   constructor() {
     this.executionProvider = new ethers.JsonRpcProvider(ETH_EXECUTION_RPC);
+    this.wsProvider = null;
     this.referenceProviders = REFERENCE_RPCS.map(url => new ethers.JsonRpcProvider(url));
     
     if (ENABLE_TELEGRAM && TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
@@ -45,6 +49,13 @@ class EthMonitor {
     }
     
     this.lastAlerts = new Map();
+    this.lastBlockTime = Date.now();
+    this.lastBlockNumber = 0;
+    this.lastMetricsCheck = 0;
+    this.lastVersionCheck = 0;
+    this.isHealthy = true;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
   }
 
   async sendTelegramAlert(message, severity = 'warning') {
@@ -58,7 +69,7 @@ class EthMonitor {
 
     try {
       await this.telegram.sendMessage(TELEGRAM_CHAT_ID, formattedMessage, { parse_mode: 'Markdown' });
-      console.log('✓ Telegram alert sent');
+      console.log(`✓ Telegram alert sent: ${severity}`);
     } catch (error) {
       console.error('✗ Failed to send Telegram alert:', error.message);
     }
@@ -103,7 +114,6 @@ class EthMonitor {
       const response = await axios.get(url, { timeout: 10000 });
       return this.parsePrometheusMetrics(response.data);
     } catch (error) {
-      console.error(`Failed to fetch metrics from ${url}:`, error.message);
       return null;
     }
   }
@@ -188,94 +198,59 @@ class EthMonitor {
     return Math.max(...validBlocks);
   }
 
-  async checkExecutionClient() {
-    try {
-      const [network, blockNumber, syncing] = await Promise.all([
-        this.executionProvider.getNetwork(),
-        this.executionProvider.getBlockNumber(),
-        this.executionProvider.send('eth_syncing', [])
-      ]);
-
-      const chainId = Number(network.chainId);
+  async handleNewBlock(blockNumber, blockHash) {
+    const now = Date.now();
+    const timeSinceLastBlock = now - this.lastBlockTime;
+    
+    console.log(`📦 New block: ${blockNumber} (${(timeSinceLastBlock / 1000).toFixed(1)}s since last)`);
+    
+    // Check for block stall (no blocks for too long)
+    if (timeSinceLastBlock > BLOCK_TIME_THRESHOLD_MS) {
+      const message = `*Block Production Stalled*\n\n` +
+        `Last block was \`${(timeSinceLastBlock / 1000).toFixed(0)}s\` ago\n` +
+        `Block: \`${blockNumber}\``;
       
-      if (chainId !== EXPECTED_CHAIN_ID) {
-        const message = `*Wrong Chain ID*\n\nExpected: \`${EXPECTED_CHAIN_ID}\`\nGot: \`${chainId}\``;
-        if (await this.shouldSendAlert('wrong_chain_id', 60)) {
-          await this.sendTelegramAlert(message, 'critical');
-        }
-        return {
-          status: 'ERROR',
-          message: `Wrong chain ID: ${chainId}`
-        };
-      }
-
-      this.lastAlerts.delete('wrong_chain_id');
-
-      return {
-        status: 'OK',
-        chainId,
-        blockNumber,
-        syncing: syncing !== false,
-        syncInfo: syncing
-      };
-    } catch (error) {
-      const message = `*Execution Client Unreachable*\n\n\`${error.message}\``;
-      if (await this.shouldSendAlert('execution_down', 60)) {
+      if (await this.shouldSendAlert('block_stall', 10)) {
         await this.sendTelegramAlert(message, 'critical');
       }
-      return {
-        status: 'ERROR',
-        message: `Execution client check failed: ${error.message}`
-      };
+    } else {
+      this.lastAlerts.delete('block_stall');
     }
-  }
 
-  async checkSyncStatus() {
+    // Check sync status against canonical chain
     try {
-      const executionBlock = await this.executionProvider.getBlockNumber();
       const canonicalBlock = await this.getCanonicalBlock();
-      const blockDelay = canonicalBlock - executionBlock;
+      const blockDelay = canonicalBlock - blockNumber;
 
       if (blockDelay > MAX_BLOCK_DELAY) {
         const message = `*Node Out of Sync*\n\n` +
           `Lag: \`${blockDelay}\` blocks\n` +
-          `Node: \`${executionBlock}\`\n` +
+          `Node: \`${blockNumber}\`\n` +
           `Canonical: \`${canonicalBlock}\``;
         
-        if (await this.shouldSendAlert('out_of_sync', 60)) {
+        if (await this.shouldSendAlert('out_of_sync', 15)) {
           await this.sendTelegramAlert(message, 'critical');
         }
-        
-        return {
-          status: 'WARNING',
-          executionBlock,
-          canonicalBlock,
-          blockDelay,
-          message: `${blockDelay} blocks behind`
-        };
+      } else {
+        this.lastAlerts.delete('out_of_sync');
       }
-
-      this.lastAlerts.delete('out_of_sync');
-
-      return {
-        status: 'OK',
-        executionBlock,
-        canonicalBlock,
-        blockDelay,
-        message: `In sync (${blockDelay} blocks behind)`
-      };
     } catch (error) {
-      return {
-        status: 'ERROR',
-        message: `Sync check failed: ${error.message}`
-      };
+      console.error('Failed to check canonical sync:', error.message);
     }
+
+    this.lastBlockTime = now;
+    this.lastBlockNumber = blockNumber;
+    this.isHealthy = true;
   }
 
-  async checkRethMetrics() {
-    if (!ETH_EXECUTION_METRICS) {
-      return { status: 'SKIPPED', message: 'Metrics URL not configured' };
+  async checkMetrics() {
+    const now = Date.now();
+    if (now - this.lastMetricsCheck < METRICS_POLL_INTERVAL_SEC * 1000) {
+      return;
     }
+    this.lastMetricsCheck = now;
+
+    if (!ETH_EXECUTION_METRICS) return;
 
     const metrics = await this.fetchMetrics(ETH_EXECUTION_METRICS);
     if (!metrics) {
@@ -283,23 +258,16 @@ class EthMonitor {
       if (await this.shouldSendAlert('reth_metrics_unavailable', 60)) {
         await this.sendTelegramAlert(message, 'warning');
       }
-      return { status: 'ERROR', message: 'Failed to fetch metrics' };
+      return;
     }
 
     this.lastAlerts.delete('reth_metrics_unavailable');
 
-    const issues = [];
-    const info = {};
-
     // Peer count
     if (metrics.network_connected_peers !== undefined) {
-      info.peers = metrics.network_connected_peers;
-      
       if (metrics.network_connected_peers < MAX_PEER_COUNT_LOW) {
-        issues.push(`Low peer count: ${metrics.network_connected_peers}`);
-        
         const message = `*Low Peer Count*\n\nPeers: \`${metrics.network_connected_peers}\`\nMin: \`${MAX_PEER_COUNT_LOW}\``;
-        if (await this.shouldSendAlert('low_peers', 120)) {
+        if (await this.shouldSendAlert('low_peers', 30)) {
           await this.sendTelegramAlert(message, 'warning');
         }
       } else {
@@ -310,13 +278,10 @@ class EthMonitor {
     // Memory usage
     if (metrics.process_resident_memory_bytes !== undefined) {
       const memoryMB = Math.floor(metrics.process_resident_memory_bytes / 1024 / 1024);
-      info.memoryMB = memoryMB;
       
       if (memoryMB > MAX_MEMORY_MB) {
-        issues.push(`High memory: ${memoryMB}MB`);
-        
         const message = `*High Memory Usage*\n\nCurrent: \`${memoryMB}MB\`\nThreshold: \`${MAX_MEMORY_MB}MB\``;
-        if (await this.shouldSendAlert('high_memory', 180)) {
+        if (await this.shouldSendAlert('high_memory', 60)) {
           await this.sendTelegramAlert(message, 'warning');
         }
       } else {
@@ -324,379 +289,240 @@ class EthMonitor {
       }
     }
 
-    // Sync progress
-    if (metrics.sync_progress !== undefined) {
-      info.syncProgress = (metrics.sync_progress * 100).toFixed(2) + '%';
-    }
-
-    // Chain tip
-    if (metrics.chain_tip_number !== undefined) {
-      info.chainTip = metrics.chain_tip_number;
-    }
-
-    // CPU usage
-    if (metrics.process_cpu_seconds_total !== undefined) {
-      info.cpuSeconds = metrics.process_cpu_seconds_total;
-    }
-
-    return {
-      status: issues.length > 0 ? 'WARNING' : 'OK',
-      issues,
-      info,
-      message: issues.length > 0 ? issues.join('; ') : 'All metrics healthy'
-    };
+    console.log(`📊 Metrics check: peers=${metrics.network_connected_peers || 'N/A'}, memory=${metrics.process_resident_memory_bytes ? Math.floor(metrics.process_resident_memory_bytes / 1024 / 1024) + 'MB' : 'N/A'}`);
   }
 
-  async checkRethVersion() {
+  async checkVersions() {
+    const now = Date.now();
+    const hoursSinceLastCheck = (now - this.lastVersionCheck) / 1000 / 3600;
+    
+    if (hoursSinceLastCheck < VERSION_CHECK_INTERVAL_HOURS) {
+      return;
+    }
+    this.lastVersionCheck = now;
+
+    console.log('🔍 Checking versions...');
+
+    // Check Reth version
     try {
-      // Get version from web3_clientVersion
       const clientVersion = await this.executionProvider.send('web3_clientVersion', []);
-      
-      // Parse Reth version (e.g., "reth/v1.0.0/...")
       const versionMatch = clientVersion.match(/reth\/v?([0-9.]+)/i);
-      if (!versionMatch) {
-        return {
-          status: 'UNKNOWN',
-          message: `Could not parse version from: ${clientVersion}`
-        };
-      }
+      
+      if (versionMatch) {
+        const currentVersion = versionMatch[1];
+        const latestRelease = await this.getLatestGitHubRelease(RETH_GITHUB_API);
+        const comparison = this.compareVersions(currentVersion, latestRelease.version);
 
-      const currentVersion = versionMatch[1];
-      const latestRelease = await this.getLatestGitHubRelease(RETH_GITHUB_API);
-      const comparison = this.compareVersions(currentVersion, latestRelease.version);
+        if (comparison.outdated === true) {
+          const message = `*Reth Update Available*\n\n` +
+            `Current: \`${currentVersion}\`\n` +
+            `Latest: \`${latestRelease.version}\`\n` +
+            `Status: ${comparison.message}\n\n` +
+            `[View Release](${latestRelease.url})`;
 
-      if (comparison.outdated === true) {
-        const message = `*Reth Update Available*\n\n` +
-          `Current: \`${currentVersion}\`\n` +
-          `Latest: \`${latestRelease.version}\`\n` +
-          `Status: ${comparison.message}\n\n` +
-          `[View Release](${latestRelease.url})`;
-
-        if (await this.shouldSendAlert('reth_outdated', 360)) {
-          await this.sendTelegramAlert(message, comparison.severity);
+          if (await this.shouldSendAlert('reth_outdated', 360)) {
+            await this.sendTelegramAlert(message, comparison.severity);
+          }
+        } else {
+          this.lastAlerts.delete('reth_outdated');
         }
-
-        return {
-          status: 'WARNING',
-          currentVersion,
-          latestVersion: latestRelease.version,
-          outdated: true,
-          severity: comparison.severity,
-          message: comparison.message
-        };
       }
-
-      this.lastAlerts.delete('reth_outdated');
-
-      return {
-        status: 'OK',
-        currentVersion,
-        latestVersion: latestRelease.version,
-        message: comparison.message
-      };
     } catch (error) {
-      return {
-        status: 'ERROR',
-        message: `Version check failed: ${error.message}`
-      };
+      console.error('Failed to check Reth version:', error.message);
+    }
+
+    // Check Lighthouse version
+    if (ETH_CONSENSUS_RPC) {
+      try {
+        const versionResponse = await axios.get(`${ETH_CONSENSUS_RPC}/eth/v1/node/version`, {
+          timeout: 10000
+        });
+
+        const versionData = versionResponse.data.data.version;
+        const versionMatch = versionData.match(/Lighthouse\/v?([0-9.]+)/i);
+        
+        if (versionMatch) {
+          const currentVersion = versionMatch[1];
+          const latestRelease = await this.getLatestGitHubRelease(LIGHTHOUSE_GITHUB_API);
+          const comparison = this.compareVersions(currentVersion, latestRelease.version);
+
+          if (comparison.outdated === true) {
+            const message = `*Lighthouse Update Available*\n\n` +
+              `Current: \`${currentVersion}\`\n` +
+              `Latest: \`${latestRelease.version}\`\n` +
+              `Status: ${comparison.message}\n\n` +
+              `[View Release](${latestRelease.url})`;
+
+            if (await this.shouldSendAlert('lighthouse_outdated', 360)) {
+              await this.sendTelegramAlert(message, comparison.severity);
+            }
+          } else {
+            this.lastAlerts.delete('lighthouse_outdated');
+          }
+        }
+      } catch (error) {
+        console.error('Failed to check Lighthouse version:', error.message);
+      }
     }
   }
 
-  async checkLighthouseConsensus() {
-    if (!ETH_CONSENSUS_RPC) {
-      return { status: 'SKIPPED', message: 'Consensus RPC not configured' };
-    }
+  async setupWebSocketConnection() {
+    console.log(`🔌 Connecting to WebSocket: ${ETH_EXECUTION_WS}`);
 
     try {
-      // Check Lighthouse health
-      const healthResponse = await axios.get(`${ETH_CONSENSUS_RPC}/eth/v1/node/health`, {
-        timeout: 10000,
-        validateStatus: () => true // Accept all status codes
+      this.wsProvider = new ethers.WebSocketProvider(ETH_EXECUTION_WS);
+
+      // Subscribe to new block headers
+      this.wsProvider.on('block', async (blockNumber) => {
+        try {
+          const block = await this.wsProvider.getBlock(blockNumber);
+          await this.handleNewBlock(blockNumber, block.hash);
+          await this.checkMetrics();
+          await this.checkVersions();
+        } catch (error) {
+          console.error('Error handling block:', error.message);
+        }
       });
 
-      // 200 = synced, 206 = syncing, 503 = not synced
+      // Access the underlying WebSocket for connection events
+      const ws = this.wsProvider.websocket;
+      
+      ws.on('error', async (error) => {
+        console.error('❌ WebSocket error:', error.message);
+        
+        const message = `*WebSocket Connection Error*\n\n\`${error.message}\``;
+        if (await this.shouldSendAlert('ws_error', 30)) {
+          await this.sendTelegramAlert(message, 'critical');
+        }
+      });
+
+      ws.on('close', () => {
+        console.warn('⚠️  WebSocket connection closed');
+        this.reconnect();
+      });
+
+      console.log('✓ WebSocket connected - listening for new blocks');
+      this.reconnectAttempts = 0;
+      
+      // Initial health check
+      const blockNumber = await this.wsProvider.getBlockNumber();
+      console.log(`📊 Current block: ${blockNumber}`);
+
+    } catch (error) {
+      console.error('Failed to setup WebSocket:', error.message);
+      this.reconnect();
+    }
+  }
+
+  async reconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      const message = `*Monitor Connection Failed*\n\nFailed to reconnect after ${this.maxReconnectAttempts} attempts`;
+      await this.sendTelegramAlert(message, 'critical');
+      
+      console.error('❌ Max reconnection attempts reached. Exiting...');
+      process.exit(1);
+    }
+
+    this.reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 60000); // Exponential backoff, max 60s
+    
+    console.log(`🔄 Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+    
+    if (this.wsProvider) {
+      try {
+        await this.wsProvider.destroy();
+      } catch (e) {
+        // Ignore errors during cleanup
+      }
+      this.wsProvider = null;
+    }
+
+    setTimeout(() => {
+      this.setupWebSocketConnection();
+    }, delay);
+  }
+
+  async checkConsensusHealth() {
+    if (!ETH_CONSENSUS_RPC) return;
+
+    try {
+      const healthResponse = await axios.get(`${ETH_CONSENSUS_RPC}/eth/v1/node/health`, {
+        timeout: 10000,
+        validateStatus: () => true
+      });
+
       const isSynced = healthResponse.status === 200;
       const isSyncing = healthResponse.status === 206;
 
       if (!isSynced && !isSyncing) {
-        const message = `*Consensus Client Issue*\n\nStatus: Not synced (${healthResponse.status})`;
-        if (await this.shouldSendAlert('consensus_not_synced', 60)) {
+        const message = `*Consensus Client Not Synced*\n\nStatus: HTTP ${healthResponse.status}`;
+        if (await this.shouldSendAlert('consensus_not_synced', 30)) {
           await this.sendTelegramAlert(message, 'critical');
         }
-        return {
-          status: 'ERROR',
-          message: `Consensus not synced (HTTP ${healthResponse.status})`
-        };
+      } else {
+        this.lastAlerts.delete('consensus_not_synced');
       }
-
-      this.lastAlerts.delete('consensus_not_synced');
-
-      // Get sync status details
-      const syncResponse = await axios.get(`${ETH_CONSENSUS_RPC}/eth/v1/node/syncing`, {
-        timeout: 10000
-      });
-
-      const syncData = syncResponse.data.data;
-
-      return {
-        status: isSynced ? 'OK' : 'SYNCING',
-        headSlot: syncData.head_slot,
-        syncDistance: syncData.sync_distance,
-        isSynced,
-        isSyncing,
-        message: isSynced ? 'Synced' : `Syncing (${syncData.sync_distance} slots behind)`
-      };
     } catch (error) {
       const message = `*Consensus Client Unreachable*\n\n\`${error.message}\``;
-      if (await this.shouldSendAlert('consensus_down', 60)) {
+      if (await this.shouldSendAlert('consensus_down', 30)) {
         await this.sendTelegramAlert(message, 'critical');
       }
-      return {
-        status: 'ERROR',
-        message: `Consensus check failed: ${error.message}`
-      };
     }
   }
 
-  async checkLighthouseVersion() {
-    if (!ETH_CONSENSUS_RPC) {
-      return { status: 'SKIPPED', message: 'Consensus RPC not configured' };
-    }
-
-    try {
-      const versionResponse = await axios.get(`${ETH_CONSENSUS_RPC}/eth/v1/node/version`, {
-        timeout: 10000
-      });
-
-      const versionData = versionResponse.data.data.version;
-      
-      // Parse Lighthouse version (e.g., "Lighthouse/v5.0.0/...")
-      const versionMatch = versionData.match(/Lighthouse\/v?([0-9.]+)/i);
-      if (!versionMatch) {
-        return {
-          status: 'UNKNOWN',
-          message: `Could not parse version from: ${versionData}`
-        };
-      }
-
-      const currentVersion = versionMatch[1];
-      const latestRelease = await this.getLatestGitHubRelease(LIGHTHOUSE_GITHUB_API);
-      const comparison = this.compareVersions(currentVersion, latestRelease.version);
-
-      if (comparison.outdated === true) {
-        const message = `*Lighthouse Update Available*\n\n` +
-          `Current: \`${currentVersion}\`\n` +
-          `Latest: \`${latestRelease.version}\`\n` +
-          `Status: ${comparison.message}\n\n` +
-          `[View Release](${latestRelease.url})`;
-
-        if (await this.shouldSendAlert('lighthouse_outdated', 360)) {
-          await this.sendTelegramAlert(message, comparison.severity);
-        }
-
-        return {
-          status: 'WARNING',
-          currentVersion,
-          latestVersion: latestRelease.version,
-          outdated: true,
-          severity: comparison.severity,
-          message: comparison.message
-        };
-      }
-
-      this.lastAlerts.delete('lighthouse_outdated');
-
-      return {
-        status: 'OK',
-        currentVersion,
-        latestVersion: latestRelease.version,
-        message: comparison.message
-      };
-    } catch (error) {
-      return {
-        status: 'ERROR',
-        message: `Version check failed: ${error.message}`
-      };
-    }
-  }
-
-  async runChecks() {
+  async startMonitoring() {
     console.log('='.repeat(70));
-    console.log('ETHEREUM NODE MONITOR - Health Check');
-    console.log(`Timestamp: ${new Date().toISOString()}`);
+    console.log('🚀 ETHEREUM MONITOR - Real-Time Event-Driven Mode');
+    console.log('='.repeat(70));
     console.log(`Execution RPC: ${ETH_EXECUTION_RPC}`);
+    console.log(`Execution WS: ${ETH_EXECUTION_WS}`);
+    console.log(`Consensus RPC: ${ETH_CONSENSUS_RPC || 'Not configured'}`);
+    console.log(`Metrics Endpoint: ${ETH_EXECUTION_METRICS || 'Not configured'}`);
+    console.log(`Metrics Poll Interval: ${METRICS_POLL_INTERVAL_SEC}s`);
     console.log(`Telegram Alerts: ${this.telegramEnabled ? 'Enabled' : 'Disabled'}`);
     console.log('='.repeat(70));
-    console.log();
-
-    let hasErrors = false;
-    let hasWarnings = false;
-
-    // Execution client check
-    console.log('⚙️  Execution Client (Reth)');
-    const execCheck = await this.checkExecutionClient();
-    if (execCheck.status === 'OK') {
-      console.log(`  ✓ Chain ID: ${execCheck.chainId}`);
-      console.log(`  ✓ Block: ${execCheck.blockNumber}`);
-      console.log(`  ✓ Syncing: ${execCheck.syncing ? 'Yes' : 'No'}`);
-    } else {
-      console.log(`  ✗ ${execCheck.message}`);
-      hasErrors = true;
-    }
-    console.log();
-
-    // Sync status
-    console.log('🔄 Sync Status');
-    const syncCheck = await this.checkSyncStatus();
-    if (syncCheck.status === 'OK') {
-      console.log(`  ✓ ${syncCheck.message}`);
-      console.log(`    Node: ${syncCheck.executionBlock} | Canonical: ${syncCheck.canonicalBlock}`);
-    } else if (syncCheck.status === 'WARNING') {
-      console.log(`  ⚠ ${syncCheck.message}`);
-      hasWarnings = true;
-    } else {
-      console.log(`  ✗ ${syncCheck.message}`);
-      hasErrors = true;
-    }
-    console.log();
-
-    // Reth metrics
-    console.log('📊 Reth Metrics');
-    const metricsCheck = await this.checkRethMetrics();
-    if (metricsCheck.status === 'OK') {
-      console.log('  ✓ All metrics healthy');
-      if (metricsCheck.info) {
-        if (metricsCheck.info.peers !== undefined) {
-          console.log(`    - Peers: ${metricsCheck.info.peers}`);
-        }
-        if (metricsCheck.info.memoryMB !== undefined) {
-          console.log(`    - Memory: ${metricsCheck.info.memoryMB}MB`);
-        }
-        if (metricsCheck.info.chainTip !== undefined) {
-          console.log(`    - Chain tip: ${metricsCheck.info.chainTip}`);
-        }
-      }
-    } else if (metricsCheck.status === 'WARNING') {
-      console.log(`  ⚠ ${metricsCheck.message}`);
-      hasWarnings = true;
-    } else if (metricsCheck.status === 'ERROR') {
-      console.log(`  ✗ ${metricsCheck.message}`);
-      hasErrors = true;
-    } else {
-      console.log(`  ⊘ ${metricsCheck.message}`);
-    }
-    console.log();
-
-    // Reth version
-    console.log('🔍 Reth Version');
-    const rethVersion = await this.checkRethVersion();
-    if (rethVersion.status === 'OK') {
-      console.log(`  ✓ Current: ${rethVersion.currentVersion}`);
-      console.log(`  ✓ Latest: ${rethVersion.latestVersion}`);
-      console.log(`  ✓ Status: ${rethVersion.message}`);
-    } else if (rethVersion.status === 'WARNING') {
-      console.log(`  ⚠ Current: ${rethVersion.currentVersion}`);
-      console.log(`  ⚠ Latest: ${rethVersion.latestVersion}`);
-      console.log(`  ⚠ ${rethVersion.message}`);
-      hasWarnings = true;
-    } else {
-      console.log(`  ✗ ${rethVersion.message}`);
-      hasErrors = true;
-    }
-    console.log();
-
-    // Consensus client
-    console.log('🏛️  Consensus Client (Lighthouse)');
-    const consensusCheck = await this.checkLighthouseConsensus();
-    if (consensusCheck.status === 'OK') {
-      console.log(`  ✓ Status: ${consensusCheck.message}`);
-      console.log(`  ✓ Head slot: ${consensusCheck.headSlot}`);
-    } else if (consensusCheck.status === 'SYNCING') {
-      console.log(`  ⚠ ${consensusCheck.message}`);
-      console.log(`    Head slot: ${consensusCheck.headSlot}`);
-      hasWarnings = true;
-    } else if (consensusCheck.status === 'ERROR') {
-      console.log(`  ✗ ${consensusCheck.message}`);
-      hasErrors = true;
-    } else {
-      console.log(`  ⊘ ${consensusCheck.message}`);
-    }
-    console.log();
-
-    // Lighthouse version
-    console.log('🔍 Lighthouse Version');
-    const lighthouseVersion = await this.checkLighthouseVersion();
-    if (lighthouseVersion.status === 'OK') {
-      console.log(`  ✓ Current: ${lighthouseVersion.currentVersion}`);
-      console.log(`  ✓ Latest: ${lighthouseVersion.latestVersion}`);
-      console.log(`  ✓ Status: ${lighthouseVersion.message}`);
-    } else if (lighthouseVersion.status === 'WARNING') {
-      console.log(`  ⚠ Current: ${lighthouseVersion.currentVersion}`);
-      console.log(`  ⚠ Latest: ${lighthouseVersion.latestVersion}`);
-      console.log(`  ⚠ ${lighthouseVersion.message}`);
-      hasWarnings = true;
-    } else if (lighthouseVersion.status === 'ERROR') {
-      console.log(`  ✗ ${lighthouseVersion.message}`);
-      hasErrors = true;
-    } else {
-      console.log(`  ⊘ ${lighthouseVersion.message}`);
-    }
-    console.log();
-
-    console.log('='.repeat(70));
-
-    if (hasErrors) {
-      console.log('STATUS: CRITICAL - Errors detected');
-      return 1;
-    } else if (hasWarnings) {
-      console.log('STATUS: WARNING - Issues detected');
-      return 0;
-    } else {
-      console.log('STATUS: HEALTHY - All checks passed');
-      return 0;
-    }
-  }
-
-  async startContinuousMonitoring() {
-    console.log(`🚀 Starting continuous monitoring (interval: ${CHECK_INTERVAL_MINUTES} minutes)`);
     console.log();
 
     // Send startup notification
     if (this.telegramEnabled) {
       const startupMessage = `🚀 *Ethereum Monitor Started*\n\n` +
-        `Execution: Reth\n` +
+        `Mode: Real-time WebSocket\n` +
+        `Execution: Reth (WS)\n` +
         `Consensus: Lighthouse\n` +
-        `Check Interval: ${CHECK_INTERVAL_MINUTES} minutes\n` +
-        `Status: Initializing first health check...`;
+        `Metrics: Every ${METRICS_POLL_INTERVAL_SEC}s\n` +
+        `Status: Connecting...`;
       
       await this.sendTelegramAlert(startupMessage, 'info');
     }
 
-    // Run immediately
-    await this.runChecks();
+    // Setup WebSocket connection
+    await this.setupWebSocketConnection();
 
-    // Then run on interval
+    // Periodic consensus health check (every 60 seconds)
     setInterval(async () => {
-      console.log();
-      await this.runChecks();
-    }, CHECK_INTERVAL_MINUTES * 60 * 1000);
+      await this.checkConsensusHealth();
+    }, 60000);
+
+    // Heartbeat check - alert if no blocks received
+    setInterval(async () => {
+      const timeSinceLastBlock = Date.now() - this.lastBlockTime;
+      
+      if (timeSinceLastBlock > 60000) { // No blocks for 60 seconds
+        const message = `*No Blocks Received*\n\n` +
+          `Last block was \`${(timeSinceLastBlock / 1000).toFixed(0)}s\` ago\n` +
+          `Block: \`${this.lastBlockNumber}\``;
+        
+        if (await this.shouldSendAlert('no_blocks', 15)) {
+          await this.sendTelegramAlert(message, 'critical');
+        }
+      }
+    }, 30000);
   }
 }
 
-// CLI
+// Start monitor
 const monitor = new EthMonitor();
-
-const args = process.argv.slice(2);
-if (args.includes('--continuous') || args.includes('-c')) {
-  monitor.startContinuousMonitoring().catch(error => {
-    console.error('Fatal error:', error);
-    process.exit(1);
-  });
-} else {
-  monitor.runChecks()
-    .then(exitCode => process.exit(exitCode))
-    .catch(error => {
-      console.error('Fatal error:', error);
-      process.exit(1);
-    });
-}
+monitor.startMonitoring().catch(error => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});

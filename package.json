@@ -4,8 +4,7 @@
   "description": "Monitor Ethereum RPC endpoints for sync status and chain consistency",
   "main": "monitor.js",
   "scripts": {
-    "start": "node monitor.js",
-    "monitor": "node monitor.js --continuous"
+    "start": "node monitor.js"
   },
   "repository": {
     "type": "git",
@@ -28,6 +27,7 @@
     "axios": "^1.13.4",
     "dotenv": "^17.2.3",
     "ethers": "^6.16.0",
-    "node-telegram-bot-api": "^0.67.0"
+    "node-telegram-bot-api": "^0.67.0",
+    "ws": "^8.19.0"
   }
 }
