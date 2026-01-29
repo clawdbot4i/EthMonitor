@@ -1,8 +1,12 @@
 const { ethers } = require('ethers');
+const TelegramBot = require('node-telegram-bot-api');
 require('dotenv').config();
 
 // Configuration
 const MONITORED_RPC = process.env.MONITORED_RPC || 'https://eth-mainnet.g.alchemy.com/v2/zaPyqXLB_lnO5weQzBEuQXvYgv2BKlQe';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const ENABLE_TELEGRAM = process.env.ENABLE_TELEGRAM === 'true';
 
 // Reference RPCs for canonical chain comparison
 const REFERENCE_RPCS = [
@@ -20,6 +24,51 @@ class EthMonitor {
   constructor() {
     this.monitoredProvider = new ethers.JsonRpcProvider(MONITORED_RPC);
     this.referenceProviders = REFERENCE_RPCS.map(url => new ethers.JsonRpcProvider(url));
+    
+    if (ENABLE_TELEGRAM && TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+      this.telegram = new TelegramBot(TELEGRAM_BOT_TOKEN);
+      this.telegramEnabled = true;
+    } else {
+      this.telegramEnabled = false;
+      if (ENABLE_TELEGRAM) {
+        console.warn('⚠ Telegram alerts disabled: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+      }
+    }
+    
+    this.lastAlerts = new Map(); // Track sent alerts to avoid spam
+  }
+
+  async sendTelegramAlert(message, severity = 'warning') {
+    if (!this.telegramEnabled) {
+      console.log(`[TELEGRAM DISABLED] ${severity.toUpperCase()}: ${message}`);
+      return;
+    }
+
+    const emoji = severity === 'critical' ? '🚨' : severity === 'warning' ? '⚠️' : 'ℹ️';
+    const formattedMessage = `${emoji} *Ethereum Monitor Alert*\n\n${message}`;
+
+    try {
+      await this.telegram.sendMessage(TELEGRAM_CHAT_ID, formattedMessage, { parse_mode: 'Markdown' });
+      console.log('✓ Telegram alert sent');
+    } catch (error) {
+      console.error('✗ Failed to send Telegram alert:', error.message);
+    }
+  }
+
+  async shouldSendAlert(alertKey, cooldownMinutes = 60) {
+    const lastSent = this.lastAlerts.get(alertKey);
+    if (!lastSent) {
+      this.lastAlerts.set(alertKey, Date.now());
+      return true;
+    }
+
+    const minutesSinceLastAlert = (Date.now() - lastSent) / 1000 / 60;
+    if (minutesSinceLastAlert >= cooldownMinutes) {
+      this.lastAlerts.set(alertKey, Date.now());
+      return true;
+    }
+
+    return false;
   }
 
   async getCanonicalBlock() {
@@ -45,11 +94,18 @@ class EthMonitor {
     const chainId = Number(network.chainId);
     
     if (chainId !== EXPECTED_CHAIN_ID) {
+      const message = `*Wrong Chain ID Detected*\n\nExpected: \`${EXPECTED_CHAIN_ID}\`\nGot: \`${chainId}\``;
+      if (await this.shouldSendAlert('wrong_chain_id', 60)) {
+        await this.sendTelegramAlert(message, 'critical');
+      }
       return {
         status: 'ERROR',
         message: `Wrong chain ID: expected ${EXPECTED_CHAIN_ID}, got ${chainId}`
       };
     }
+    
+    // Clear alert when back to normal
+    this.lastAlerts.delete('wrong_chain_id');
     
     return { status: 'OK', message: `Chain ID: ${chainId}` };
   }
@@ -61,22 +117,49 @@ class EthMonitor {
       const blockDelay = canonicalBlock - monitoredBlock;
 
       if (blockDelay > MAX_BLOCK_DELAY) {
+        const message = `*Node Out of Sync*\n\n` +
+          `Node is \`${blockDelay}\` blocks behind\n` +
+          `Monitored: \`${monitoredBlock}\`\n` +
+          `Canonical: \`${canonicalBlock}\``;
+        
+        if (await this.shouldSendAlert('out_of_sync', 60)) {
+          await this.sendTelegramAlert(message, 'critical');
+        }
+        
         return {
           status: 'WARNING',
           message: `Node is ${blockDelay} blocks behind (monitored: ${monitoredBlock}, canonical: ${canonicalBlock})`
         };
-      } else if (blockDelay < 0) {
+      } else if (blockDelay < -5) {
+        const message = `*Node Reporting Unusual Block Height*\n\n` +
+          `Node reports: \`${monitoredBlock}\`\n` +
+          `Canonical: \`${canonicalBlock}\`\n` +
+          `Ahead by: \`${Math.abs(blockDelay)}\` blocks`;
+        
+        if (await this.shouldSendAlert('ahead_of_chain', 60)) {
+          await this.sendTelegramAlert(message, 'warning');
+        }
+        
         return {
           status: 'WARNING',
           message: `Node reports block ${monitoredBlock} but canonical is ${canonicalBlock} (ahead by ${Math.abs(blockDelay)})`
         };
       }
 
+      // Clear alerts when back to normal
+      this.lastAlerts.delete('out_of_sync');
+      this.lastAlerts.delete('ahead_of_chain');
+
       return {
         status: 'OK',
         message: `In sync: block ${monitoredBlock} (${blockDelay} blocks behind)`
       };
     } catch (error) {
+      const message = `*Sync Check Failed*\n\n\`${error.message}\``;
+      if (await this.shouldSendAlert('sync_check_failed', 60)) {
+        await this.sendTelegramAlert(message, 'critical');
+      }
+      
       return {
         status: 'ERROR',
         message: `Failed to check sync status: ${error.message}`
@@ -112,11 +195,23 @@ class EthMonitor {
       // Check if block hash matches
       const referenceHash = validReferenceBlocks[0].hash;
       if (monitoredBlockData.hash !== referenceHash) {
+        const message = `*Block Hash Mismatch - Possible Fork!*\n\n` +
+          `Block: \`${blockNumber}\`\n` +
+          `Monitored hash: \`${monitoredBlockData.hash.substring(0, 10)}...\`\n` +
+          `Canonical hash: \`${referenceHash.substring(0, 10)}...\``;
+        
+        if (await this.shouldSendAlert('block_hash_mismatch', 30)) {
+          await this.sendTelegramAlert(message, 'critical');
+        }
+        
         return {
           status: 'ERROR',
           message: `Block hash mismatch at ${blockNumber}! Monitored: ${monitoredBlockData.hash}, Canonical: ${referenceHash}`
         };
       }
+
+      // Clear alert when back to normal
+      this.lastAlerts.delete('block_hash_mismatch');
 
       return {
         status: 'OK',
@@ -138,11 +233,23 @@ class EthMonitor {
       const timeDiff = currentTime - blockTimestamp;
 
       if (timeDiff > BLOCK_TIME_THRESHOLD_MS) {
+        const secondsOld = Math.floor(timeDiff / 1000);
+        const message = `*Stale Block Detected*\n\n` +
+          `Latest block is \`${secondsOld}s\` old\n` +
+          `Threshold: \`${BLOCK_TIME_THRESHOLD_MS / 1000}s\``;
+        
+        if (await this.shouldSendAlert('stale_block', 60)) {
+          await this.sendTelegramAlert(message, 'warning');
+        }
+        
         return {
           status: 'WARNING',
           message: `Latest block is ${Math.floor(timeDiff / 1000)}s old (threshold: ${BLOCK_TIME_THRESHOLD_MS / 1000}s)`
         };
       }
+
+      // Clear alert when back to normal
+      this.lastAlerts.delete('stale_block');
 
       return {
         status: 'OK',
@@ -161,6 +268,7 @@ class EthMonitor {
     console.log('ETH MONITOR - Health Check');
     console.log(`Timestamp: ${new Date().toISOString()}`);
     console.log(`Monitored RPC: ${MONITORED_RPC}`);
+    console.log(`Telegram Alerts: ${this.telegramEnabled ? 'Enabled' : 'Disabled'}`);
     console.log('='.repeat(60));
     console.log();
 
