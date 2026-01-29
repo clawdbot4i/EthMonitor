@@ -32,6 +32,16 @@ const MAX_PEER_COUNT_LOW = 10;
 const MAX_MEMORY_MB = 16000;
 const VERSION_CHECK_INTERVAL_HOURS = 6;
 
+// Alert severity levels with cooldown times (in minutes)
+const ALERT_LEVELS = {
+  CRITICAL_URGENT: { cooldown: 30, emoji: '🔴', priority: 1 },   // Security/integrity issues
+  CRITICAL: { cooldown: 10, emoji: '🚨', priority: 2 },           // System failures
+  HIGH: { cooldown: 30, emoji: '⚠️', priority: 3 },               // Performance degradation
+  MEDIUM: { cooldown: 120, emoji: '📋', priority: 4 },            // Non-urgent issues
+  LOW: { cooldown: 360, emoji: '📌', priority: 5 },               // Informational/maintenance
+  INFO: { cooldown: 0, emoji: 'ℹ️', priority: 6 }                 // Status messages (once)
+};
+
 class EthMonitor {
   constructor() {
     this.executionProvider = new ethers.JsonRpcProvider(ETH_EXECUTION_RPC);
@@ -58,24 +68,35 @@ class EthMonitor {
     this.maxReconnectAttempts = 10;
   }
 
-  async sendTelegramAlert(message, severity = 'warning') {
+  async sendTelegramAlert(message, alertLevel = 'HIGH') {
     if (!this.telegramEnabled) {
-      console.log(`[TELEGRAM DISABLED] ${severity.toUpperCase()}: ${message}`);
+      console.log(`[TELEGRAM DISABLED] ${alertLevel}: ${message}`);
       return;
     }
 
-    const emoji = severity === 'critical' ? '🚨' : severity === 'warning' ? '⚠️' : 'ℹ️';
-    const formattedMessage = `${emoji} *Ethereum Monitor Alert*\n\n${message}`;
+    const level = ALERT_LEVELS[alertLevel] || ALERT_LEVELS.HIGH;
+    const formattedMessage = `${level.emoji} *Ethereum Monitor Alert*\n\n${message}\n\n_Severity: ${alertLevel}_`;
 
     try {
       await this.telegram.sendMessage(TELEGRAM_CHAT_ID, formattedMessage, { parse_mode: 'Markdown' });
-      console.log(`✓ Telegram alert sent: ${severity}`);
+      console.log(`✓ Telegram alert sent: ${alertLevel} (priority ${level.priority})`);
     } catch (error) {
       console.error('✗ Failed to send Telegram alert:', error.message);
     }
   }
 
-  async shouldSendAlert(alertKey, cooldownMinutes = 60) {
+  async shouldSendAlert(alertKey, alertLevel = 'HIGH') {
+    const level = ALERT_LEVELS[alertLevel] || ALERT_LEVELS.HIGH;
+    
+    // INFO alerts are only sent once
+    if (alertLevel === 'INFO') {
+      if (this.lastAlerts.has(alertKey)) {
+        return false;
+      }
+      this.lastAlerts.set(alertKey, Date.now());
+      return true;
+    }
+
     const lastSent = this.lastAlerts.get(alertKey);
     if (!lastSent) {
       this.lastAlerts.set(alertKey, Date.now());
@@ -83,7 +104,7 @@ class EthMonitor {
     }
 
     const minutesSinceLastAlert = (Date.now() - lastSent) / 1000 / 60;
-    if (minutesSinceLastAlert >= cooldownMinutes) {
+    if (minutesSinceLastAlert >= level.cooldown) {
       this.lastAlerts.set(alertKey, Date.now());
       return true;
     }
@@ -210,8 +231,8 @@ class EthMonitor {
         `Last block was \`${(timeSinceLastBlock / 1000).toFixed(0)}s\` ago\n` +
         `Block: \`${blockNumber}\``;
       
-      if (await this.shouldSendAlert('block_stall', 10)) {
-        await this.sendTelegramAlert(message, 'critical');
+      if (await this.shouldSendAlert('block_stall', 'CRITICAL')) {
+        await this.sendTelegramAlert(message, 'CRITICAL');
       }
     } else {
       this.lastAlerts.delete('block_stall');
@@ -228,8 +249,8 @@ class EthMonitor {
           `Node: \`${blockNumber}\`\n` +
           `Canonical: \`${canonicalBlock}\``;
         
-        if (await this.shouldSendAlert('out_of_sync', 15)) {
-          await this.sendTelegramAlert(message, 'critical');
+        if (await this.shouldSendAlert('out_of_sync', 'CRITICAL')) {
+          await this.sendTelegramAlert(message, 'CRITICAL');
         }
       } else {
         this.lastAlerts.delete('out_of_sync');
@@ -255,8 +276,8 @@ class EthMonitor {
     const metrics = await this.fetchMetrics(ETH_EXECUTION_METRICS);
     if (!metrics) {
       const message = '*Reth Metrics Unavailable*';
-      if (await this.shouldSendAlert('reth_metrics_unavailable', 60)) {
-        await this.sendTelegramAlert(message, 'warning');
+      if (await this.shouldSendAlert('reth_metrics_unavailable', 'HIGH')) {
+        await this.sendTelegramAlert(message, 'HIGH');
       }
       return;
     }
@@ -267,8 +288,8 @@ class EthMonitor {
     if (metrics.network_connected_peers !== undefined) {
       if (metrics.network_connected_peers < MAX_PEER_COUNT_LOW) {
         const message = `*Low Peer Count*\n\nPeers: \`${metrics.network_connected_peers}\`\nMin: \`${MAX_PEER_COUNT_LOW}\``;
-        if (await this.shouldSendAlert('low_peers', 30)) {
-          await this.sendTelegramAlert(message, 'warning');
+        if (await this.shouldSendAlert('low_peers', 'HIGH')) {
+          await this.sendTelegramAlert(message, 'HIGH');
         }
       } else {
         this.lastAlerts.delete('low_peers');
@@ -281,8 +302,8 @@ class EthMonitor {
       
       if (memoryMB > MAX_MEMORY_MB) {
         const message = `*High Memory Usage*\n\nCurrent: \`${memoryMB}MB\`\nThreshold: \`${MAX_MEMORY_MB}MB\``;
-        if (await this.shouldSendAlert('high_memory', 60)) {
-          await this.sendTelegramAlert(message, 'warning');
+        if (await this.shouldSendAlert('high_memory', 'HIGH')) {
+          await this.sendTelegramAlert(message, 'HIGH');
         }
       } else {
         this.lastAlerts.delete('high_memory');
@@ -320,8 +341,11 @@ class EthMonitor {
             `Status: ${comparison.message}\n\n` +
             `[View Release](${latestRelease.url})`;
 
-          if (await this.shouldSendAlert('reth_outdated', 360)) {
-            await this.sendTelegramAlert(message, comparison.severity);
+          // Major versions are CRITICAL_URGENT, others are LOW
+          const alertLevel = comparison.severity === 'critical' ? 'CRITICAL_URGENT' : 'LOW';
+          
+          if (await this.shouldSendAlert('reth_outdated', alertLevel)) {
+            await this.sendTelegramAlert(message, alertLevel);
           }
         } else {
           this.lastAlerts.delete('reth_outdated');
@@ -353,8 +377,11 @@ class EthMonitor {
               `Status: ${comparison.message}\n\n` +
               `[View Release](${latestRelease.url})`;
 
-            if (await this.shouldSendAlert('lighthouse_outdated', 360)) {
-              await this.sendTelegramAlert(message, comparison.severity);
+            // Major versions are CRITICAL_URGENT, others are LOW
+            const alertLevel = comparison.severity === 'critical' ? 'CRITICAL_URGENT' : 'LOW';
+            
+            if (await this.shouldSendAlert('lighthouse_outdated', alertLevel)) {
+              await this.sendTelegramAlert(message, alertLevel);
             }
           } else {
             this.lastAlerts.delete('lighthouse_outdated');
@@ -391,8 +418,8 @@ class EthMonitor {
         console.error('❌ WebSocket error:', error.message);
         
         const message = `*WebSocket Connection Error*\n\n\`${error.message}\``;
-        if (await this.shouldSendAlert('ws_error', 30)) {
-          await this.sendTelegramAlert(message, 'critical');
+        if (await this.shouldSendAlert('ws_error', 'CRITICAL')) {
+          await this.sendTelegramAlert(message, 'CRITICAL');
         }
       });
 
@@ -417,7 +444,7 @@ class EthMonitor {
   async reconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       const message = `*Monitor Connection Failed*\n\nFailed to reconnect after ${this.maxReconnectAttempts} attempts`;
-      await this.sendTelegramAlert(message, 'critical');
+      await this.sendTelegramAlert(message, 'CRITICAL');
       
       console.error('❌ Max reconnection attempts reached. Exiting...');
       process.exit(1);
@@ -456,16 +483,16 @@ class EthMonitor {
 
       if (!isSynced && !isSyncing) {
         const message = `*Consensus Client Not Synced*\n\nStatus: HTTP ${healthResponse.status}`;
-        if (await this.shouldSendAlert('consensus_not_synced', 30)) {
-          await this.sendTelegramAlert(message, 'critical');
+        if (await this.shouldSendAlert('consensus_not_synced', 'CRITICAL')) {
+          await this.sendTelegramAlert(message, 'CRITICAL');
         }
       } else {
         this.lastAlerts.delete('consensus_not_synced');
       }
     } catch (error) {
       const message = `*Consensus Client Unreachable*\n\n\`${error.message}\``;
-      if (await this.shouldSendAlert('consensus_down', 30)) {
-        await this.sendTelegramAlert(message, 'critical');
+      if (await this.shouldSendAlert('consensus_down', 'CRITICAL')) {
+        await this.sendTelegramAlert(message, 'CRITICAL');
       }
     }
   }
@@ -485,14 +512,16 @@ class EthMonitor {
 
     // Send startup notification
     if (this.telegramEnabled) {
-      const startupMessage = `🚀 *Ethereum Monitor Started*\n\n` +
+      const startupMessage = `*Ethereum Monitor Started*\n\n` +
         `Mode: Real-time WebSocket\n` +
         `Execution: Reth (WS)\n` +
         `Consensus: Lighthouse\n` +
         `Metrics: Every ${METRICS_POLL_INTERVAL_SEC}s\n` +
         `Status: Connecting...`;
       
-      await this.sendTelegramAlert(startupMessage, 'info');
+      if (await this.shouldSendAlert('startup', 'INFO')) {
+        await this.sendTelegramAlert(startupMessage, 'INFO');
+      }
     }
 
     // Setup WebSocket connection
@@ -512,8 +541,8 @@ class EthMonitor {
           `Last block was \`${(timeSinceLastBlock / 1000).toFixed(0)}s\` ago\n` +
           `Block: \`${this.lastBlockNumber}\``;
         
-        if (await this.shouldSendAlert('no_blocks', 15)) {
-          await this.sendTelegramAlert(message, 'critical');
+        if (await this.shouldSendAlert('no_blocks', 'CRITICAL')) {
+          await this.sendTelegramAlert(message, 'CRITICAL');
         }
       }
     }, 30000);
