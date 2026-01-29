@@ -314,6 +314,16 @@ class EthMonitor {
     console.log(`🚀 Starting continuous monitoring (interval: ${CHECK_INTERVAL_MINUTES} minutes)`);
     console.log();
 
+    // Send startup notification
+    if (this.telegramEnabled) {
+      const startupMessage = `🚀 *Ethereum Monitor Started*\n\n` +
+        `Node: \`${MONITORED_RPC.substring(0, 50)}...\`\n` +
+        `Check Interval: ${CHECK_INTERVAL_MINUTES} minutes\n` +
+        `Status: Initializing first health check...`;
+      
+      await this.sendTelegramAlert(startupMessage, 'info');
+    }
+
     // Run immediately
     await this.runChecks();
 
