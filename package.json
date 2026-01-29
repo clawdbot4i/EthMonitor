@@ -1,0 +1,31 @@
+{
+  "name": "ethmonitor",
+  "version": "1.0.0",
+  "description": "Monitor Ethereum RPC endpoints for sync status and chain consistency",
+  "main": "monitor.js",
+  "scripts": {
+    "start": "node monitor.js",
+    "watch": "watch -n 60 'npm start'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clawdbot4i/EthMonitor.git"
+  },
+  "keywords": [
+    "ethereum",
+    "monitoring",
+    "rpc",
+    "blockchain",
+    "sync"
+  ],
+  "author": "clawdbot4i",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/clawdbot4i/EthMonitor/issues"
+  },
+  "homepage": "https://github.com/clawdbot4i/EthMonitor#readme",
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "ethers": "^6.16.0"
+  }
+}
