@@ -14,6 +14,7 @@ const REFERENCE_RPCS = [
 const EXPECTED_CHAIN_ID = 1; // Ethereum Mainnet
 const MAX_BLOCK_DELAY = 10; // Maximum acceptable blocks behind
 const BLOCK_TIME_THRESHOLD_MS = 30000; // Alert if block is older than 30 seconds
+const CHECK_INTERVAL_MINUTES = parseInt(process.env.CHECK_INTERVAL_MINUTES || '60');
 
 class EthMonitor {
   constructor() {
@@ -191,20 +192,45 @@ class EthMonitor {
     console.log('='.repeat(60));
     if (hasErrors) {
       console.log('STATUS: CRITICAL - Errors detected');
-      process.exit(1);
+      return 1;
     } else if (hasWarnings) {
       console.log('STATUS: WARNING - Some checks raised warnings');
-      process.exit(0);
+      return 0;
     } else {
       console.log('STATUS: HEALTHY - All checks passed');
-      process.exit(0);
+      return 0;
     }
+  }
+
+  async startContinuousMonitoring() {
+    console.log(`🚀 Starting continuous monitoring (interval: ${CHECK_INTERVAL_MINUTES} minutes)`);
+    console.log();
+
+    // Run immediately
+    await this.runChecks();
+
+    // Then run on interval
+    setInterval(async () => {
+      console.log();
+      await this.runChecks();
+    }, CHECK_INTERVAL_MINUTES * 60 * 1000);
   }
 }
 
-// Run monitor
+// CLI
 const monitor = new EthMonitor();
-monitor.runChecks().catch(error => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+
+const args = process.argv.slice(2);
+if (args.includes('--continuous') || args.includes('-c')) {
+  monitor.startContinuousMonitoring().catch(error => {
+    console.error('Fatal error:', error);
+    process.exit(1);
+  });
+} else {
+  monitor.runChecks()
+    .then(exitCode => process.exit(exitCode))
+    .catch(error => {
+      console.error('Fatal error:', error);
+      process.exit(1);
+    });
+}
